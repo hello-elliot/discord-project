@@ -1,5 +1,3 @@
-import fetch from 'node-fetch';
-
 export default async function handler(req, res) {
   const { url } = req.query;
 
@@ -16,7 +14,8 @@ export default async function handler(req, res) {
       throw new Error(`Failed to fetch image: ${response.statusText}`);
     }
 
-    const buffer = await response.buffer();
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
     res.setHeader('Content-Type', response.headers.get('content-type') || 'image/png');
     res.setHeader('Cache-Control', 'public, max-age=31536000');
     res.send(buffer);
