@@ -1,4 +1,5 @@
-import { useEffect, useState } from 'react';
+/* eslint-disable react/no-unescaped-entities */
+import { useEffect, useState, useCallback } from 'react';
 import { Button } from '@/components/ui/button';
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
 import {
@@ -56,7 +57,7 @@ export default function Home() {
   const [selectedRole, setSelectedRole] = useState(null);
   const [roleUsers, setRoleUsers] = useState([]);
 
-  const fetchData = async () => {
+  const fetchData = useCallback(async () => {
     try {
       setLoading(true);
       setError(null);
@@ -114,14 +115,14 @@ export default function Home() {
       setLoadingMessage('Loading...');
       console.log('Fetch data completed. Loading:', loading);
     }
-  };
+  }, [page, limit]); // Dependencies for useCallback
 
   // Fetch data on initial mount only if not already fetched
   useEffect(() => {
     if (session && !hasFetched) {
       fetchData();
     }
-  }, [session]);
+  }, [session, hasFetched, fetchData]); // Added fetchData and hasFetched to dependencies
 
   useEffect(() => {
     console.log('Filtering messages...');
@@ -740,7 +741,12 @@ export default function Home() {
                   />
                   <ChartTooltip
                     content={<ChartTooltipContent />}
-                    labelFormatter={(label) => format(parseISO(label), 'dd/MM/yyyy')}
+                    labelFormatter={(label) => {
+                      const date = parseISO(label);
+                      const euDate = format(date, 'dd/MM/yyyy');
+                      console.log(`Tooltip Label Formatter: ${label} -> ${euDate}`);
+                      return euDate;
+                    }}
                   />
                   <Line
                     dataKey="newMembers"
