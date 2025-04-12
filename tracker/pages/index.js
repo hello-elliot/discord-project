@@ -16,15 +16,9 @@ import {
 import { DatePicker } from '@/components/ui/date-picker';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Label } from '@/components/ui/label';
-import { startOfDay, endOfDay, addDays, eachDayOfInterval, format, parseISO, differenceInDays } from "date-fns";
-import { createClient } from '@supabase/supabase-js';
-import sentiment from 'sentiment';
-
-// Initialize Supabase client
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL,
-  process.env.NEXT_PUBLIC_SUPABASE_KEY
-);
+import { startOfDay, endOfDay, addDays, eachDayOfInterval, format, parseISO, differenceInDays, differenceInHours } from "date-fns";
+import { SentimentIntensityAnalyzer } from 'vader-sentiment';
+import { useSession, signIn, signOut } from 'next-auth/react';
 
 // Test sentiment library directly
 const testSentiment = () => {
@@ -34,176 +28,158 @@ const testSentiment = () => {
     "This is awesome!!!"
   ];
   testMessages.forEach(msg => {
-    const result = sentiment(msg);
+    const result = SentimentIntensityAnalyzer.polarity_scores(msg);
     console.log('Test Sentiment:', msg, result);
   });
 };
 testSentiment();
 
 export default function Home() {
+  const { data: session } = useSession();
   const [messages, setMessages] = useState([]);
   const [filteredMessages, setFilteredMessages] = useState([]);
   const [members, setMembers] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [startDate, setStartDate] = useState(addDays(new Date(), -7)); // Start 7 days ago
-  const [endDate, setEndDate] = useState(endOfDay(new Date())); // End today, including current time
+  const [voiceData, setVoiceData] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [loadingMessage, setLoadingMessage] = useState('Loading...');
+  const [hasFetched, setHasFetched] = useState(false);
+  const [startDate, setStartDate] = useState(addDays(new Date(), -7));
+  const [endDate, setEndDate] = useState(endOfDay(new Date()));
   const [selectedChannel, setSelectedChannel] = useState('all');
   const [error, setError] = useState(null);
   const [allContributors, setAllContributors] = useState({});
+  const [page, setPage] = useState(1);
+  const limit = 100;
+
+  // State for the modal
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [selectedRole, setSelectedRole] = useState(null);
+  const [roleUsers, setRoleUsers] = useState([]);
 
   const fetchData = async () => {
     try {
       setLoading(true);
       setError(null);
-      const messagesRes = await fetch('/api/messages');
+      setLoadingMessage('Fetching messages from Discord channels...');
+      const messagesRes = await fetch(`/api/messages?page=${page}&limit=${limit}`);
       if (!messagesRes.ok) {
         const text = await messagesRes.text();
         throw new Error(`Failed to fetch messages: ${messagesRes.status} - ${text}`);
       }
       const messagesData = await messagesRes.json();
-      console.log('Fetched messages:', messagesData.slice(0, 2));
+      console.log('Raw fetched messages:', messagesData);
+      console.log('Fetched messages (first 2):', messagesData.slice(0, 2));
+      console.log('Message user_ids:', messagesData.map(msg => msg.user_id));
       setMessages(messagesData);
       setFilteredMessages(messagesData);
 
-      const { data: membersData, error: membersError } = await supabase
-        .from('members')
-        .select('*');
-      if (membersError) {
-        console.error('Error fetching members:', membersError);
-        throw membersError;
+      setLoadingMessage('Fetching members from Supabase...');
+      const membersRes = await fetch(`/api/supabase?table=members&page=${page}&limit=${limit}`);
+      if (!membersRes.ok) {
+        const text = await membersRes.text();
+        throw new Error(`Failed to fetch members: ${membersRes.status} - ${text}`);
       }
+      const membersData = await membersRes.json();
       console.log('Fetched members:', membersData);
+      console.log('Member user_ids:', membersData.map(member => member.user_id));
       setMembers(membersData);
 
+      setLoadingMessage('Fetching voice activity from Supabase...');
+      const voiceRes = await fetch(`/api/supabase?table=voice_activity&page=${page}&limit=${limit}`);
+      if (!voiceRes.ok) {
+        const text = await voiceRes.text();
+        throw new Error(`Failed to fetch voice activity: ${voiceRes.status} - ${text}`);
+      }
+      const voiceData = await voiceRes.json();
+      console.log('Fetched voice data:', voiceData);
+      setVoiceData(voiceData);
+
+      setLoadingMessage('Building contributors list...');
       const contributors = {};
       for (const msg of messagesData) {
         if (msg.user_id && !contributors[msg.user_id]) {
-          contributors[msg.user_id] = {
-            username: msg.username || msg.user_id,
-          };
+          const username = msg.author?.username || (msg.author?.global_name || `User_${msg.user_id}`);
+          contributors[msg.user_id] = { username };
         }
       }
+      console.log('Contributors:', contributors);
       setAllContributors(contributors);
+
+      setHasFetched(true);
     } catch (err) {
       console.error('Error fetching data:', err);
       setError(`Failed to load data: ${err.message}`);
     } finally {
       setLoading(false);
+      setLoadingMessage('Loading...');
+      console.log('Fetch data completed. Loading:', loading);
     }
   };
 
+  // Fetch data on initial mount only if not already fetched
   useEffect(() => {
-    fetchData();
-
-    // Subscription for messages
-    const messagesSubscription = supabase
-      .channel('public:messages')
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, (payload) => {
-        setMessages((prev) => [...prev, payload.new]);
-        if (payload.new.user_id && !allContributors[payload.new.user_id]) {
-          setAllContributors((prev) => ({
-            ...prev,
-            [payload.new.user_id]: {
-              username: payload.new.username || payload.new.user_id,
-            }
-          }));
-        }
-      })
-      .subscribe();
-
-    // Subscription for members
-    const membersSubscription = supabase
-      .channel('public:members')
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'members' }, (payload) => {
-        setMembers((prev) => {
-          const updatedMembers = prev.filter(m => m.user_id !== payload.new.user_id);
-          return [...updatedMembers, payload.new];
-        });
-      })
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'members' }, (payload) => {
-        setMembers((prev) => {
-          const updatedMembers = prev.filter(m => m.user_id !== payload.new.user_id);
-          return [...updatedMembers, payload.new];
-        });
-      })
-      .subscribe();
-
-    return () => {
-      messagesSubscription.unsubscribe();
-      membersSubscription.unsubscribe();
-    };
-  }, []);
+    if (session && !hasFetched) {
+      fetchData();
+    }
+  }, [session]);
 
   useEffect(() => {
+    console.log('Filtering messages...');
     let filtered = messages;
 
-    if (startDate && endDate) {
-      const maxDays = 180;
-      const daysBetween = differenceInDays(endDate, startDate);
-      if (daysBetween > maxDays) {
-        setEndDate(addDays(startDate, maxDays));
-      }
-      const start = startOfDay(startDate).getTime();
-      const end = endOfDay(endDate).getTime();
-      console.log('Date Range for Messages:', { start: new Date(start), end: new Date(end) });
-      filtered = messages.filter(msg => {
-        const msgTimestamp = Number(msg.timestamp); // Discord timestamp in milliseconds
-        console.log('Message:', msg.content, 'Timestamp:', msgTimestamp, 'In Range:', msgTimestamp >= start && msgTimestamp <= end);
-        return msgTimestamp >= start && msgTimestamp <= end;
-      });
-    }
+    console.log('Selected Channel:', selectedChannel);
     if (selectedChannel !== 'all') {
-      filtered = filtered.filter(msg => msg.channel_name === selectedChannel);
+      filtered = filtered.filter(msg => {
+        console.log(`Filtering message: channel_name=${msg.channel_name}, selectedChannel=${selectedChannel}, match=${msg.channel_name === selectedChannel}`);
+        return msg.channel_name === selectedChannel;
+      });
     }
 
     console.log("Filtered Messages:", filtered);
     setFilteredMessages(filtered);
-  }, [startDate, endDate, selectedChannel, messages]);
+  }, [selectedChannel, messages]);
+
+  useEffect(() => {
+    console.log('Session status:', session);
+    if (!session) return;
+
+    console.log('No Supabase subscriptions since operations are server-side.');
+  }, [session, allContributors]);
+
+  if (!session) {
+    return (
+      <div className="p-4">
+        <h1 className="text-2xl font-bold mb-4">Discord Community Tracker</h1>
+        <Button onClick={() => signIn('discord')}>Sign in with Discord</Button>
+      </div>
+    );
+  }
 
   const activeMembers = new Set(
     filteredMessages
       .filter(msg => {
         const sevenDaysAgo = endDate ? addDays(endDate, -7).getTime() : addDays(new Date(), -7).getTime();
-        return Number(msg.timestamp) >= sevenDaysAgo;
+        return new Date(msg.timestamp).getTime() >= sevenDaysAgo;
       })
       .map(msg => msg.user_id)
   ).size;
 
   const activeMembersInRange = new Set(filteredMessages.map(msg => msg.user_id)).size;
-
-  const totalMembers = new Set(members.map(m => m.user_id)).size; // Changed to count all members
-
+  const totalMembers = new Set(members.map(m => m.user_id)).size;
   const totalMessages = filteredMessages.length;
-  const topContributors = Object.entries(
-    filteredMessages.reduce((acc, msg) => {
-      acc[msg.user_id] = (acc[msg.user_id] || 0) + 1;
-      return acc;
-    }, {})
-  )
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 5)
-    .map(([user_id, count]) => ({
-      user_id,
-      username: allContributors[user_id]?.username || user_id,
-      count
-    }));
   const engagementRate = totalMembers > 0 ? (activeMembersInRange / totalMembers) * 100 : 0;
   console.log('Engagement Rate Debug:', { totalMembers, activeMembersInRange, engagementRate });
 
   // Sentiment Analysis
   const analyzeSentiment = () => {
+    console.log('Analyzing sentiment for filtered messages...');
     const sentimentScores = filteredMessages.map(msg => {
       const content = typeof msg.content === 'string' && msg.content.trim() !== '' ? msg.content : '';
       if (content) {
         try {
-          const result = sentiment(content);
+          const result = SentimentIntensityAnalyzer.polarity_scores(content);
           console.log('Sentiment for:', content, result);
-          if (result && typeof result.score === 'number' && typeof result.comparative === 'number') {
-            return { score: result.score, comparative: result.comparative };
-          } else {
-            console.warn(`Invalid sentiment result for content: ${content}`, result);
-            return { score: 0, comparative: 0 };
-          }
+          return { score: result.compound, comparative: result.compound };
         } catch (err) {
           console.error(`Sentiment analysis failed for content: ${content}`, err);
           return { score: 0, comparative: 0 };
@@ -212,7 +188,8 @@ export default function Home() {
       return { score: 0, comparative: 0 };
     });
     const averageScore = sentimentScores.reduce((sum, s) => sum + (s.score || 0), 0) / (sentimentScores.length || 1);
-    const sentimentStatus = averageScore > 0 ? 'Positive' : averageScore < 0 ? 'Negative' : 'Neutral';
+    const sentimentStatus = averageScore > 0.05 ? 'Positive' : averageScore < -0.05 ? 'Negative' : 'Neutral';
+    console.log('Sentiment Analysis Result:', { averageScore, sentimentStatus });
     return { averageScore, sentimentStatus };
   };
 
@@ -220,11 +197,11 @@ export default function Home() {
 
   // Member Growth and Retention Metrics
   const calculateGrowthMetrics = () => {
+    console.log('Calculating growth metrics...');
     const dailyJoins = {};
     const dailyLeaves = {};
     const dateRange = eachDayOfInterval({ start: startDate, end: endDate });
 
-    // Calculate daily joins and leaves
     members.forEach(member => {
       const joinDate = member.joined_at ? format(new Date(member.joined_at), 'yyyy-MM-dd') : null;
       const leaveDate = member.left_at ? format(new Date(member.left_at), 'yyyy-MM-dd') : null;
@@ -239,12 +216,10 @@ export default function Home() {
     console.log('Daily Joins:', dailyJoins);
     console.log('Daily Leaves:', dailyLeaves);
 
-    // Total new members and churned members in the date range
     const totalNewMembers = Object.values(dailyJoins).reduce((sum, count) => sum + count, 0);
     const totalChurnedMembers = Object.values(dailyLeaves).reduce((sum, count) => sum + count, 0);
     const netGrowth = totalNewMembers - totalChurnedMembers;
 
-    // Retention Rate: Users who joined in the last 30 days and are still active
     const thirtyDaysAgo = addDays(endDate, -30).getTime();
     const sevenDaysAgo = addDays(endDate, -7).getTime();
     const recentJoins = members.filter(m => {
@@ -257,7 +232,6 @@ export default function Home() {
     }).length;
     const retentionRate = recentJoins.length > 0 ? (retainedUsers / recentJoins.length) * 100 : 0;
 
-    // Growth Data for Chart
     const growthData = dateRange.map(date => {
       const dateStr = format(date, 'yyyy-MM-dd');
       return {
@@ -273,14 +247,122 @@ export default function Home() {
 
   const { totalNewMembers, totalChurnedMembers, netGrowth, retentionRate, growthData } = calculateGrowthMetrics();
 
+  // New Messages Metric (within the selected date range)
+  const calculateNewMessages = () => {
+    console.log('Calculating new messages...');
+    const sevenDaysAgo = addDays(endDate, -7).getTime();
+    const newMessages = filteredMessages.filter(msg => new Date(msg.timestamp).getTime() >= sevenDaysAgo).length;
+    const previousMessages = messages.filter(msg => {
+      const msgTime = new Date(msg.timestamp).getTime();
+      return msgTime < sevenDaysAgo && msgTime >= addDays(sevenDaysAgo, -7).getTime();
+    }).length;
+    const growth = previousMessages > 0 ? ((newMessages - previousMessages) / previousMessages) * 100 : 0;
+    console.log('New Messages Calculation:', { newMessages, previousMessages, growth });
+    return { newMessages, growth };
+  };
+
+  const { newMessages, growth: messagesGrowth } = calculateNewMessages();
+
+  // User Roles (Orbit Model)
+  const calculateUserRoles = () => {
+    const sevenDaysAgo = addDays(new Date(), -7).getTime();
+    const fourteenDaysAgo = addDays(new Date(), -14).getTime();
+    const thirtyDaysAgo = addDays(new Date(), -30).getTime();
+
+    // Debug logs to check data sources
+    console.log('Members:', members);
+    console.log('Filtered Messages:', filteredMessages);
+
+    // Create a Map to count messages per user efficiently
+    const messageCounts = new Map();
+    for (const msg of filteredMessages) {
+      const userId = String(msg.user_id).trim();
+      messageCounts.set(userId, (messageCounts.get(userId) || 0) + 1);
+    }
+
+    // Calculate user activity metrics
+    const userActivity = members.map(member => {
+      const memberUserId = String(member.user_id).trim();
+      const userMessages = messageCounts.get(memberUserId) || 0;
+      console.log(`Messages for user ${member.user_id} (${member.username}):`, userMessages);
+      const lastActive = member.last_active ? new Date(member.last_active).getTime() : 0;
+
+      // Debug log for each member
+      console.log(`User ${member.user_id} (${member.username}):`, {
+        userMessages,
+        lastActive: lastActive ? new Date(lastActive) : 'N/A',
+        memberUserId,
+      });
+
+      // Classify user into an orbit
+      let orbit = 'Visitor';
+      if (userMessages > 50 && lastActive >= sevenDaysAgo) {
+        orbit = 'Ambassador';
+      } else if (userMessages >= 10 && lastActive >= fourteenDaysAgo) {
+        orbit = 'Contributor';
+      } else if (userMessages >= 1 && lastActive >= thirtyDaysAgo) {
+        orbit = 'Member';
+      }
+
+      return {
+        user_id: member.user_id,
+        username: member.username,
+        messages: userMessages,
+        lastActive,
+        orbit,
+      };
+    });
+
+    // Aggregate trends
+    const orbitTrends = {
+      Ambassador: userActivity.filter(u => u.orbit === 'Ambassador').length,
+      Contributor: userActivity.filter(u => u.orbit === 'Contributor').length,
+      Member: userActivity.filter(u => u.orbit === 'Member').length,
+      Visitor: userActivity.filter(u => u.orbit === 'Visitor').length,
+    };
+
+    // Get top ambassadors
+    const ambassadors = userActivity
+      .filter(u => u.orbit === 'Ambassador')
+      .sort((a, b) => b.messages - a.messages)
+      .slice(0, 5);
+
+    console.log('User Activity:', userActivity);
+    console.log('Orbit Trends:', orbitTrends);
+    console.log('Top Ambassadors:', ambassadors);
+
+    return { userActivity, orbitTrends, ambassadors };
+  };
+
+  const { userActivity, orbitTrends, ambassadors } = calculateUserRoles();
+
+  // Function to open the modal with users for a specific role
+  const openRoleModal = (role, e) => {
+    e.preventDefault();
+    console.log('Opening modal for role:', role);
+    const usersInRole = userActivity
+      .filter(user => user.orbit === role)
+      .sort((a, b) => b.lastActive - a.lastActive);
+    setRoleUsers(usersInRole);
+    setSelectedRole(role);
+    setIsModalOpen(true);
+  };
+
+  const closeModal = () => {
+    setIsModalOpen(false);
+    setSelectedRole(null);
+    setRoleUsers([]);
+  };
+
   const channels = ['all', ...new Set(messages.map(msg => msg.channel_name || 'unknown'))];
 
   const prepareChartData = () => {
+    console.log('Preparing chart data...');
     const dateRange = startDate && endDate ? eachDayOfInterval({ start: startDate, end: endDate }) : [];
     console.log('Date Range:', dateRange.map(d => format(d, 'yyyy-MM-dd')));
     
     const messagesByDateAndChannel = filteredMessages.reduce((acc, msg) => {
-      const date = new Date(Number(msg.timestamp));
+      const date = parseISO(msg.timestamp);
       const dateKey = format(date, 'yyyy-MM-dd');
       const channel = msg.channel_name || 'unknown';
       if (!acc[dateKey]) acc[dateKey] = {};
@@ -331,6 +413,7 @@ export default function Home() {
   return (
     <div className="p-4">
       <h1 className="text-2xl font-bold mb-4">Discord Community Tracker</h1>
+      <Button onClick={() => signOut()} className="mb-4">Sign Out</Button>
 
       {/* Filters */}
       <div className="mb-4 flex items-end space-x-4">
@@ -375,17 +458,28 @@ export default function Home() {
             const start = addDays(end, -7);
             setStartDate(start);
             setEndDate(end);
+            fetchData();
           }}
         >
           Last 7 Days
+        </Button>
+        <Button
+          variant="outline"
+          className="h-10 w-[120px]"
+          onClick={fetchData}
+          disabled={loading}
+        >
+          {loading ? 'Loading...' : 'Fetch Data'}
         </Button>
       </div>
 
       {/* Metrics */}
       {loading ? (
-        <p>Loading...</p>
+        <p className="text-center text-gray-500">{loadingMessage}</p>
       ) : error ? (
         <p className="text-red-500">{error}</p>
+      ) : messages.length === 0 && members.length === 0 ? (
+        <p className="text-center text-gray-500">No data available. Click "Fetch Data" to load data.</p>
       ) : (
         <>
           {/* Row 1: Membership Overview */}
@@ -456,6 +550,15 @@ export default function Home() {
             </Card>
             <Card className="hover:bg-zinc-100 transition-colors">
               <CardHeader>
+                <CardTitle>New Messages (Last 7 Days)</CardTitle>
+                <p className="text-sm text-muted-foreground">Growth: {messagesGrowth.toFixed(2)}%</p>
+              </CardHeader>
+              <CardContent>
+                <p className="text-2xl font-bold">{newMessages || '0'}</p>
+              </CardContent>
+            </Card>
+            <Card className="hover:bg-zinc-100 transition-colors">
+              <CardHeader>
                 <CardTitle>Engagement Rate</CardTitle>
               </CardHeader>
               <CardContent>
@@ -474,30 +577,81 @@ export default function Home() {
             </Card>
           </div>
 
-          {/* Top Contributors */}
-          <Card className="mb-4">
-            <CardHeader>
-              <CardTitle>Top Contributors</CardTitle>
-            </CardHeader>
-            <CardContent>
-              {loading ? (
-                <p>Loading...</p>
-              ) : topContributors.length > 0 ? (
-                <ul className="space-y-2">
-                  {topContributors.map((contributor, index) => (
-                    <li key={index} className="flex items-center">
-                      {createInitialAvatar(contributor.username)}
-                      <span>
-                        {contributor.username || contributor.user_id} ({contributor.count} messages)
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-              ) : (
-                <p>No contributors yet.</p>
-              )}
-            </CardContent>
-          </Card>
+          {/* Community Engagement */}
+          <div className="relative">
+            <Card className="mb-4">
+              <CardHeader>
+                <CardTitle>Community Engagement</CardTitle>
+                <p className="text-sm text-muted-foreground">Engagement levels across all users based on messages and recency</p>
+              </CardHeader>
+              <CardContent>
+                <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-4">
+                  <div className="cursor-pointer" onClick={(e) => openRoleModal('Ambassador', e)}>
+                    <p className="text-lg font-bold">Ambassadors</p>
+                    <p className="text-2xl">{orbitTrends.Ambassador || '0'}</p>
+                  </div>
+                  <div className="cursor-pointer" onClick={(e) => openRoleModal('Contributor', e)}>
+                    <p className="text-lg font-bold">Contributors</p>
+                    <p className="text-2xl">{orbitTrends.Contributor || '0'}</p>
+                  </div>
+                  <div className="cursor-pointer" onClick={(e) => openRoleModal('Member', e)}>
+                    <p className="text-lg font-bold">Members</p>
+                    <p className="text-2xl">{orbitTrends.Member || '0'}</p>
+                  </div>
+                  <div className="cursor-pointer" onClick={(e) => openRoleModal('Visitor', e)}>
+                    <p className="text-lg font-bold">Visitors</p>
+                    <p className="text-2xl">{orbitTrends.Visitor || '0'}</p>
+                  </div>
+                </div>
+                <h3 className="text-lg font-bold mt-4">Top Ambassadors</h3>
+                {ambassadors.length > 0 ? (
+                  <ul className="space-y-2 mt-2">
+                    {ambassadors.map((ambassador, index) => (
+                      <li key={index} className="flex items-center">
+                        {createInitialAvatar(ambassador.username)}
+                        <span>
+                          {ambassador.username} ({ambassador.messages} messages)
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p>No ambassadors yet.</p>
+                )}
+              </CardContent>
+            </Card>
+
+            {/* Custom Modal */}
+            {isModalOpen && (
+              <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50">
+                <div className="bg-white rounded-lg shadow-lg p-6 w-full max-w-lg max-h-[85vh] overflow-y-auto">
+                  <button className="absolute top-4 right-4 text-gray-500 hover:text-gray-700" onClick={closeModal}>
+                    <span className="text-2xl">×</span>
+                  </button>
+                  <h2 className="text-xl font-bold mb-2">{selectedRole ? `${selectedRole} users` : 'Users'}</h2>
+                  <p className="text-sm text-gray-500 mb-4">
+                    List of users classified as {selectedRole ? selectedRole.toLowerCase() : ''} based on their activity.
+                  </p>
+                  <div>
+                    {roleUsers.length > 0 ? (
+                      <ul className="space-y-2">
+                        {roleUsers.map((user, index) => (
+                          <li key={index} className="flex items-center">
+                            {createInitialAvatar(user.username)}
+                            <span>
+                              {user.username} (last active: {format(new Date(user.lastActive), 'MMM d, yyyy')})
+                            </span>
+                          </li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <p>No users in this role.</p>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
 
           {/* Channel Activity Chart */}
           <Card className="mb-4">
@@ -609,55 +763,37 @@ export default function Home() {
             </CardContent>
           </Card>
 
-          {/* User Activity Trends Table */}
+          {/* Voice Activity Card */}
           <Card className="mb-4">
             <CardHeader>
-              <CardTitle>User Activity Trends</CardTitle>
+              <CardTitle>Voice Activity (Last 5 Entries)</CardTitle>
             </CardHeader>
             <CardContent>
-              <table className="w-full mt-2 border-collapse">
-                <thead>
-                  <tr className="bg-gray-100">
-                    <th className="border p-2 text-left">Username</th>
-                    <th className="border p-2 text-left">Messages Sent</th>
-                    <th className="border p-2 text-left">Most Active Channel</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {Object.entries(
-                    filteredMessages.reduce((acc, msg) => {
-                      acc[msg.user_id] = acc[msg.user_id] || { count: 0, channel: '' };
-                      acc[msg.user_id].count += 1;
-                      const userMessages = filteredMessages.filter(m => m.user_id === msg.user_id);
-                      const channelCounts = userMessages.reduce((counts, m) => {
-                        counts[m.channel_name] = (counts[m.channel_name] || 0) + 1;
-                        return counts;
-                      }, {});
-                      const mostActiveChannel = Object.keys(channelCounts).reduce((a, b) =>
-                        channelCounts[a] > channelCounts[b] ? a : b, 'unknown'
-                      );
-                      acc[msg.user_id].channel = mostActiveChannel;
-                      return acc;
-                    }, {})
-                  )
-                    .sort((a, b) => b[1].count - a[1].count)
-                    .slice(0, 5)
-                    .map(([user_id, { count, channel }], index) => (
-                      <tr key={index} className="border">
-                        <td className="p-2">{allContributors[user_id]?.username || user_id}</td>
-                        <td className="p-2">{count}</td>
-                        <td className="p-2">{channel}</td>
-                      </tr>
-                    ))}
-                </tbody>
-              </table>
+              {voiceData.length > 0 ? (
+                <ul className="space-y-2">
+                  {voiceData.slice(0, 5).map((v) => (
+                    <li key={v.id}>
+                      {v.user_id} in {v.channel_name}: {v.joined_at} - {v.left_at || 'Still Active'}
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p>No voice activity yet.</p>
+              )}
             </CardContent>
           </Card>
+
+          {/* Pagination Buttons */}
+          <div className="flex space-x-4 mb-4">
+            <Button onClick={() => setPage(page - 1)} disabled={page === 1}>Previous Page</Button>
+            <Button onClick={() => setPage(page + 1)}>Next Page</Button>
+          </div>
+
+          <Button className="mt-4" onClick={fetchData} disabled={loading}>
+            {loading ? 'Loading...' : 'Refresh Data'}
+          </Button>
         </>
       )}
-      <Button className="mt-4" onClick={fetchData} disabled={loading}>
-        {loading ? 'Loading...' : 'Refresh Data'}
-      </Button>
     </div>
   );
 }
