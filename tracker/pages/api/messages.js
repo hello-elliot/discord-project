@@ -1,6 +1,3 @@
-// tracker/pages/api/messages.js
-
-import { NextApiRequest, NextApiResponse } from 'next';
 import fetch from 'node-fetch';
 
 // Simple sleep function to add a delay
@@ -17,7 +14,7 @@ export default async function handler(req, res) {
     }
 
     // Replace with your Discord server (guild) ID
-    const guildId = '1014882925893926912'; // Replace with the actual guild ID, e.g., '987654321098765432'
+    const guildId = '1014882925893926912'; // Replace with the actual guild ID
     console.log('Using guildId:', guildId);
 
     // Fetch the bot's guilds to confirm it's in the correct server
